@@ -1,0 +1,10 @@
+LICENSE
+README.md
+pyproject.toml
+MIJax/MIJax.py
+MIJax/__init__.py
+MIJax.egg-info/PKG-INFO
+MIJax.egg-info/SOURCES.txt
+MIJax.egg-info/dependency_links.txt
+MIJax.egg-info/requires.txt
+MIJax.egg-info/top_level.txt

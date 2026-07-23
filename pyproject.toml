@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MIJax"
+version = "0.1.0"
+description = "A package for analysis of microlensing images with JAX"
+authors = [
+    { name = "Etienne Bachelet", email = "etibachelet@gmail.com" }
+]
+license = "GPL-3.0-or-later"
+readme = "README.md"
+keywords = ["astronomy", "microlensing", "jax"]
+
+dependencies = [
+    "jax>=0.4.0",
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "astropy>=5.0",
+    "photutils>=1.0",
+    "astroquery>=0.4",
+    "scikit-image>=0.19"
+]
+
+[project.urls]
+"Documentation" = "https://github.com/euclid-egbs/MIJax"
+"Source Code" = "https://github.com/euclid-egbs/MIJax"

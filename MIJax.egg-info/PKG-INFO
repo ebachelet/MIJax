@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: MIJax
+Version: 0.1.0
+Summary: A package for analysis of microlensing images with JAX
+Author-email: Etienne Bachelet <etibachelet@gmail.com>
+License-Expression: GPL-3.0-or-later
+Project-URL: Documentation, https://github.com/euclid-egbs/MIJax
+Project-URL: Source Code, https://github.com/euclid-egbs/MIJax
+Keywords: astronomy,microlensing,jax
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: jax>=0.4.0
+Requires-Dist: numpy>=1.21
+Requires-Dist: scipy>=1.7
+Requires-Dist: astropy>=5.0
+Requires-Dist: photutils>=1.0
+Requires-Dist: astroquery>=0.4
+Requires-Dist: scikit-image>=0.19
+Dynamic: license-file
+
+# MIJax
+Images tool in JAX to reconstruct high resolution image and more

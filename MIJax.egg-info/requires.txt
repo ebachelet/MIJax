@@ -1,0 +1,7 @@
+jax>=0.4.0
+numpy>=1.21
+scipy>=1.7
+astropy>=5.0
+photutils>=1.0
+astroquery>=0.4
+scikit-image>=0.19
