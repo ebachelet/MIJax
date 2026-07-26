@@ -23,13 +23,24 @@ import astropy.units as u
 
 #Basics information relative to your event
 
+#Target
+targ_name = 'OB130341'
+ra = 268.0312083333333
+dec = -29.84611111111111
+
 oversample = 2
 padding = 10
 directory = '/home/ebachele/Work/Euclid/OGLE-2013-BLG-0341/'
-ref_coord = SkyCoord(ra=268.0312083333333*u.deg, dec=-29.84611111111111*u.deg)
+
+#Output filenames (all keyed off targ_name)
+gaia_file = f'Gaia_{targ_name}.tbl'
+resampled_file = f'resampled_{targ_name}.fits'
+psf_file = f'psf_{targ_name}.fits'
+
+ref_coord = SkyCoord(ra=ra*u.deg, dec=dec*u.deg)
 
 #Dowloading Gaia catalog around the target
-res_gaia = get_Gaia(ref_coord,'./','Gaia_OB130341.tbl')
+res_gaia = get_Gaia(ref_coord,'./',gaia_file)
 
 
 #Collecting data from the directory containing the stamps prepared by Manon Gilles scripts
@@ -67,8 +78,8 @@ masks =  ~jnp.array(Euclid_data[-3]).astype(bool)
 #Opening or computing the stacking image with a factor oversample
 try:
 
-    reconstructed = fits.open('resampled_OB130341.fits')[0].data[0]
-    reconstructed_sigma = fits.open('resampled_OB130341.fits')[0].data[1]
+    reconstructed = fits.open(resampled_file)[0].data[0]
+    reconstructed_sigma = fits.open(resampled_file)[0].data[1]
 
 except:
 
@@ -77,9 +88,9 @@ except:
    
     reconstructed_sigma = np.sqrt(np.abs(reconstructed))
 
-    hdu = fits.PrimaryHDU(data=[reconstructed,reconstructed_sigma]) 
-    output_filename = 'resampled_OB130341.fits' 
-    hdu.writeto(output_filename, overwrite=True) 
+    hdu = fits.PrimaryHDU(data=[reconstructed,reconstructed_sigma])
+    output_filename = resampled_file
+    hdu.writeto(output_filename, overwrite=True)
     print(f"Image successfully saved to {output_filename}")
  
 
@@ -89,7 +100,7 @@ except:
 #Opening or estimating a basic psf
 try:
 
-    psf0 = fits.open('psf_OB130341.fits')[0].data
+    psf0 = fits.open(psf_file)[0].data
     
 except:
 
@@ -99,7 +110,7 @@ except:
   
 
     psf0 = psf0_from_cutouts(np.array(cutouts_psf))
-    fits.HDUList([ fits.PrimaryHDU(data=psf)]).writeto('psf_OB130341.fits',overwrite=True)
+    fits.HDUList([ fits.PrimaryHDU(data=psf)]).writeto(psf_file,overwrite=True)
 
 
 
@@ -125,9 +136,6 @@ from astropy.io import fits
 hdu = fits.PrimaryHDU(data=[reconstructed,reconstructed_sigma], header=header)
 
 
-output_filename = 'resampled_OB130341.fits' 
-hdu.writeto(output_filename, overwrite=True) 
+output_filename = resampled_file
+hdu.writeto(output_filename, overwrite=True)
 print(f"Image successfully saved to {output_filename}")
-
-
-
