@@ -12,7 +12,7 @@ from photutils.detection import DAOStarFinder
 from astropy.stats import mad_std
 import numpy as np
 import astropy.units as u
-from astroquery.gaia import Gaia
+from astroquery.vizier import Vizier
 from astropy.io import fits, ascii
 import astropy.wcs as wcs
 from astropy.coordinates import SkyCoord
@@ -2033,7 +2033,7 @@ def refine_psf(image,psf,poses,error,iterations = 20):
     
 #Data access  
 
-def get_Gaia(ref_coord, Gaia_directory, Gaia_name):
+def get_Gaia(ref_coord, Gaia_directory, Gaia_name,size=1.5, limit= 100000):
 
     path = Gaia_directory + Gaia_name
 
@@ -2042,19 +2042,83 @@ def get_Gaia(ref_coord, Gaia_directory, Gaia_name):
 
     except:
 
-        width = u.Quantity(1.5, u.arcmin)
-        height = u.Quantity(1.5, u.arcmin)
+#        width = u.Quantity(size, u.arcmin)
+#        height = u.Quantity(size, u.arcmin)
 
-        Gaia.ROW_LIMIT = 1000
+#        Gaia.ROW_LIMIT = limit
+#        columns = [
+#                "source_id",
+#                "ra",
+#                "dec",
+#                "parallax",
+#                "pmra",
+#                "pmdec",
+#                "phot_g_mean_mag",
+#                "phot_bp_mean_mag",
+#                "phot_rp_mean_mag",
+#                "ruwe",
+#            ]
+#        res_gaia = Gaia.query_object_async(
+#            coordinate=ref_coord,
+#            width=width,
+#            height=height,
+#            columns=columns
+#        )
 
-        res_gaia = Gaia.query_object_async(
-            coordinate=ref_coord,
-            width=width,
-            height=height
+#        res_gaia.write(path, format='ascii.ecsv', overwrite=True)
+               # VizieR query configuration
+        Vizier.ROW_LIMIT = limit
+
+        columns = [
+            "Source",
+            "RA_ICRS",
+            "DE_ICRS",
+            "Plx",
+            "pmRA",
+            "pmDE",
+            "Gmag",
+            "BPmag",
+            "RPmag",
+            "RUWE",
+        ]
+
+        v = Vizier(
+            columns=columns,
+            row_limit=limit
         )
 
-        res_gaia.write(path, format='ascii.ecsv', overwrite=True)
-        
+        # Query a square region
+        result = v.query_region(
+            ref_coord,
+            width=size * u.arcmin,
+            height=size * u.arcmin,
+            catalog="I/355/gaiadr3"
+        )
+
+        if len(result) == 0:
+            return Table()
+
+        res_gaia = result[0]
+
+        # Rename columns to match the Gaia archive output
+        res_gaia.rename_column("Source", "source_id")
+        res_gaia.rename_column("RA_ICRS", "ra")
+        res_gaia.rename_column("DE_ICRS", "dec")
+        res_gaia.rename_column("Plx", "parallax")
+        res_gaia.rename_column("pmRA", "pmra")
+        res_gaia.rename_column("pmDE", "pmdec")
+        res_gaia.rename_column("Gmag", "phot_g_mean_mag")
+        res_gaia.rename_column("BPmag", "phot_bp_mean_mag")
+        res_gaia.rename_column("RPmag", "phot_rp_mean_mag")
+
+        res_gaia.write(path, format="ascii.ecsv", overwrite=True)
+
+    # Mask bad G-band data
+    res_gaia = res_gaia[
+        np.isfinite(res_gaia["phot_g_mean_mag"])
+    ]
+
+    return res_gaia
     #masking bad data    
     res_gaia = res_gaia[np.isfinite(res_gaia['phot_g_mean_mag'])]
     
@@ -2196,23 +2260,256 @@ def crop_images_to_smallest(images):
 
     return cropped_images
     
+    
+def find_catalog_translation(cat1, cat2, search_radius=100,
+                             bin_size=1.0, smooth=2):
+    """
+    Find translation [dx, dy] such that:
+
+        cat1 + [dx, dy] ~= cat2
+
+    cat1, cat2 : (N, 2), (M, 2)
+        x,y star positions in pixels.
+    """
+    import numpy as np
+    from scipy.spatial import cKDTree
+    from scipy.ndimage import gaussian_filter
+    cat1 = np.asarray(cat1[:, :2], dtype=float)
+    cat2 = np.asarray(cat2[:, :2], dtype=float)
+
+    # Remove invalid positions
+    cat1 = cat1[np.all(np.isfinite(cat1), axis=1)]
+    cat2 = cat2[np.all(np.isfinite(cat2), axis=1)]
+
+    tree = cKDTree(cat2)
+
+    offsets = []
+
+    # Find possible counterparts within a LARGE radius
+    for p in cat1:
+
+        ind = tree.query_ball_point(p, search_radius)
+
+        if len(ind):
+            offsets.extend(cat2[ind] - p)
+
+    offsets = np.asarray(offsets)
+
+    if len(offsets) == 0:
+        raise RuntimeError("No possible matches")
+
+    # ---------------------------------------------------------
+    # Histogram of dx, dy
+    # ---------------------------------------------------------
+
+    bins = np.arange(
+        -search_radius,
+        search_radius + bin_size,
+        bin_size
+    )
+
+    H, xedges, yedges = np.histogram2d(
+        offsets[:, 0],
+        offsets[:, 1],
+        bins=(bins, bins)
+    )
+
+    # Smooth to make the peak easier to identify
+    H = gaussian_filter(H, smooth)
+
+    # Strongest peak
+    ix, iy = np.unravel_index(
+        np.argmax(H),
+        H.shape
+    )
+
+    dx = 0.5 * (xedges[ix] + xedges[ix + 1])
+    dy = 0.5 * (yedges[iy] + yedges[iy + 1])
+
+    return np.array([dx, dy]), H
+
+
+def MATRIX(x,center):
+    theta, tx, ty = x
+
+    c = np.cos(theta)
+    s = np.sin(theta)
+
+    cx, cy = center
+
+    M = np.array([
+        [c, -s, cx - c*cx + s*cy + tx],
+        [s,  c, cy - s*cx - c*cy + ty],
+        [0,  0, 1],
+    ])
+
+    return M
+    
+from skimage.transform import SimilarityTransform, warp
+
+
+def transform_image(x, image, center):
+    """
+    Transform image2 by rotation around `center` followed by translation.
+
+    Parameters
+    ----------
+    x : array-like
+        [angle_deg, dx, dy]
+
+    image : 2D ndarray
+        Image to transform.
+
+    center : (cx, cy)
+        Rotation center in (x, y) pixel coordinates.
+
+    Returns
+    -------
+    transformed : 2D ndarray
+    """
+
+    angle, dx, dy = x[:3]
+    
+
+    cx, cy = center
+
+    # Translate center -> origin
+    t1 = SimilarityTransform(
+        translation=(-cx, -cy)
+    )
+
+    # Rotate around origin
+    rot = SimilarityTransform(
+        rotation=angle
+    )
+
+    # Translate origin -> center, then apply shift
+    t2 = SimilarityTransform(
+        translation=(cx + dx, cy + dy)
+    )
+
+    # Transformation:
+    # image coordinates:
+    #
+    # x' = T2 * R * T1 * x
+    #
+    # Note: composition order is important.
+    transform = t1 + rot + t2
+
+    transformed = warp(
+        image,
+        inverse_map=transform.inverse,
+        output_shape=image.shape,
+        order=1,
+        mode="constant",
+        cval=0.0,
+        preserve_range=True
+    )
+
+    return transformed,transform
+
+
+def objective2(x, image1, image2, center):
+    """
+    Maximize the normalized cross-correlation between image1
+    and transformed image2.
+
+    The optimizer minimizes the returned value, so we return
+    -correlation.
+    """
+
+    image2_transformed,_ = transform_image(
+        x,
+        image2,
+        center
+    )
+
+    a = image1.astype(np.float64)
+    b = image2_transformed.astype(np.float64)
+
+    # Valid finite pixels
+    valid = np.isfinite(a) & np.isfinite(b)
+
+    if valid.sum() < 100:
+        return 1e6
+
+    a = a[valid]
+    b = b[valid]
+
+    # Remove mean
+    a -= np.mean(a)
+    b -= np.mean(b)
+
+    # Normalized cross correlation
+    norm = np.sqrt(
+        np.sum(a ** 2) *
+        np.sum(b ** 2)
+    )
+
+    if norm == 0:
+        return 1e6
+
+    correlation = np.sum(a * b) / norm
+
+    return -correlation
+    
+    
+    
 def recompute_WCS(init_wcs,gaia_catalog,image,factor=1,psf_size=1,
         threshold_sigma=3,
         peakmax=40000,
         min_separation=1):
+        import scipy.ndimage as snd
 
         if factor>=2:
             shift = [0,0]
         else:
-        
-            mod = build_image_model(init_wcs,gaia_catalog, shape=image.shape, psf_sigma=factor,factor=factor)
-            shift, error, diffphase = phase_cross_correlation(mod, image,upsample_factor=100)    
-        
-        star_positions,full_catalog, bkg = detect_stars(image, psf_size,threshold_sigma=threshold_sigma,
+            sort = gaia_catalog['phot_g_mean_mag'].argsort()
+            #gaia_catalog['flux'] = 10**(gaia_catalog['phot_g_mean_mag']/2.5)
+            mod = build_image_model(init_wcs,gaia_catalog[sort][:1000], shape=image.shape, psf_sigma=psf_size,factor=factor)
+            star_positions,full_catalog, bkg = detect_stars(image, psf_size,threshold_sigma=threshold_sigma,
         peakmax=peakmax,
-        min_separation=min_separation)           
-        newcs,match,match_tot = refine_wcs(gaia_catalog,star_positions[:,:2][-2000:]-0.5,init_wcs,shift=shift[::-1],factor=factor,threshold=1,iteration=5)
-        indexes = np.arange(0,len(star_positions)).astype(int)[-2000:]
+        min_separation=min_separation)  
+            pixels = np.array(init_wcs.world_to_pixel(SkyCoord(gaia_catalog['ra'],gaia_catalog['dec']))).T
+            
+            radec = init_wcs.pixel_to_world( star_positions[-1000:,0], star_positions[-1000:,1])
+            im_catalog = {'ra':radec.ra.value,'dec':radec.dec.value}
+            mod2 = build_image_model(init_wcs,im_catalog, shape=image.shape, psf_sigma=psf_size,factor=factor)
+            shift, error, diffphase = phase_cross_correlation(mod,image,upsample_factor=100)
+            shift2, error2, diffphase2 = phase_cross_correlation(mod,mod2,upsample_factor=100)
+
+            pixels = np.array(init_wcs.world_to_pixel(SkyCoord(gaia_catalog['ra'],gaia_catalog['dec']))).T
+#            M, result = fit_rotation_shift(
+#                            pixels[sort][:1000],
+#                            star_positions[-1000:,:2],10,
+#                            np.array(mod.shape)/2,
+#                            x0=(0, 0, 0),
+#                        )
+
+#            print("angle =", result.x[0])
+#            print("dx    =", result.x[1])
+#            print("dy    =", result.x[2])
+#            print("Nmatch =", -result.fun)
+            from scipy.optimize import differential_evolution
+            
+            
+            result = differential_evolution(objective2, bounds=(
+                        (-np.pi/4,np.pi/4),  # theta
+                        (-100, 100),                       # tx
+                        (-100, 100),                       # ty
+                    ),
+                    args=(
+                mod,mod2,
+                np.array(mod.shape)/2
+                ),
+                    workers=1,
+                    polish=True,disp=True,
+                )
+
+            
+        _, M = transform_image(result['x'], mod,  np.array(mod.shape)/2)
+        newcs,match,match_tot = refine_wcs(gaia_catalog[sort][:1000],star_positions[-1000:,:2],init_wcs,shift=M,factor=factor,threshold=1,iteration=5)
+        indexes = np.arange(0,len(star_positions)).astype(int)
         match[:,1] = indexes[match[:,1]]
 
         return newcs,shift,match,star_positions
@@ -2221,9 +2518,12 @@ def refine_wcs(gaia,img,wcs_img,shift=None,threshold = 1,factor=1,iteration = 5)
     
     wc = wcs_img
     img2 = img.copy()
+
     if shift is not None:
-        img2 += shift
-        
+        #img2 += shift
+
+        cat_h = np.c_[img2, np.ones(len(img2))]
+        img2 = ( shift@ cat_h.T).T[:, :2]   
     for i in range(iteration):
     
         
@@ -2240,7 +2540,7 @@ def refine_wcs(gaia,img,wcs_img,shift=None,threshold = 1,factor=1,iteration = 5)
         valid = idx < len(img2)  # only matched stars
         matches = np.column_stack([np.arange(len(pixels))[valid], idx[valid],dist[valid]])
         matche = np.column_stack([np.arange(len(pixels))[valid], idx[valid]])
-
+        print(i,len(matche),np.median(matches[:,2]))
         try:
         
             new_wcs = fit_wcs_from_points(img2[matche[:,1],:2].T,SkyCoord(gaia[matche[:,0]]['ra']*u.deg,gaia[matche[:,0]]['dec']*u.deg))
@@ -2249,71 +2549,95 @@ def refine_wcs(gaia,img,wcs_img,shift=None,threshold = 1,factor=1,iteration = 5)
         
             new_wcs = fit_wcs_from_points(img2[matche[:,1],:2].T,SkyCoord(gaia[matche[:,0]]['ra'],gaia[matche[:,0]]['dec']))
     
-        print(i,len(matche),np.median(matches[:,2]))
+
         #
        
         wc = new_wcs
         factor = 1
-        
+        thresh = 1
 
     try:
         finalwcs = fit_wcs_from_points(img[matche[:,1],:2].T,SkyCoord(gaia[matche[:,0]]['ra']*u.deg,gaia[matche[:,0]]['dec']*u.deg))
     except:
         finalwcs = fit_wcs_from_points(img[matche[:,1],:2].T,SkyCoord(gaia[matche[:,0]]['ra'],gaia[matche[:,0]]['dec']))
 
+
+    try:
+        pixels = finalwcs.world_to_pixel(SkyCoord(gaia['ra']*u.deg,gaia['dec']*u.deg))
+    except:
+        pixels = finalwcs.world_to_pixel(SkyCoord(gaia['ra'],gaia['dec']))
+    pixels = np.array(pixels).T*factor
+    plt.scatter( img[matche[:,1],0], img[matche[:,1], 1])
+    plt.scatter( pixels[matche[:,0],0], pixels[matche[:,0], 1])
+    plt.show()
+    breakpoint()
     return finalwcs,matche,matches
   
   
 
   
   
-def build_image_model(wcs, catalog, shape=(1000, 1000), psf_sigma=1.0,factor=1):
-    """
-    Construct an image model based on WCS and a catalog of RA/Dec positions.
-
-    Parameters
-    ----------
-    wcs : astropy.wcs.WCS
-        WCS object describing the image world coordinate system.
-    catalog : astropy.table.Table
-        Catalog with 'ra' and 'dec' columns in degrees, optionally 'flux'.
-    shape : tuple
-        Shape of the output image (ny, nx).
-    psf_sigma : float
-        Standard deviation of Gaussian PSF in pixels.
-
-    Returns
-    -------
-    image : 2D numpy array
-        Simulated image with sources from catalog.
-    """
+def build_image_model(wcs, catalog, shape=(1000, 1000), psf_sigma=1.0, factor=1):
+    
     ny, nx = shape
-    image = np.zeros((ny, nx), dtype=float)
+    image = np.zeros((ny, nx), dtype=np.float64)
 
-    # Loop through catalog and add Gaussian sources
-    for row in catalog:
-        ra = row['ra']
-        dec = row['dec']
-        flux = row.get('flux', 1.0)  # default flux=1 if not given
+    # Vectorized RA/Dec -> pixel coordinates
+    coords = SkyCoord(
+        ra=np.asarray(catalog["ra"]) * u.deg,
+        dec=np.asarray(catalog["dec"]) * u.deg
+    )
 
-        # Convert RA/Dec to pixel coordinates
-        x, y = wcs.world_to_pixel(SkyCoord(ra=ra*u.deg, dec=dec*u.deg))
-        x *= factor
-        y *= factor
-        
-        # Make sure coordinates are inside image
-        if 0 <= x < nx and 0 <= y < ny:
-            # Define a Gaussian PSF
-            gauss = Gaussian2D(amplitude=flux, x_mean=x, y_mean=y, x_stddev=psf_sigma, y_stddev=psf_sigma)
+    x, y = wcs.world_to_pixel(coords)
+    x *= factor
+    y *= factor
 
-            # Define a small patch around source to evaluate the Gaussian
-            x_min = max(int(x - 3*psf_sigma), 0)
-            x_max = min(int(x + 3*psf_sigma)+1, nx)
-            y_min = max(int(y - 3*psf_sigma), 0)
-            y_max = min(int(y + 3*psf_sigma)+1, ny)
+    # Flux, default = 1
+    try:
+        flux = np.asarray(catalog["flux"], dtype=np.float64)
+    except:
+        flux = np.ones(len(catalog['ra']), dtype=np.float64)*100
 
-            yy, xx = np.mgrid[y_min:y_max, x_min:x_max]
-            image[y_min:y_max, x_min:x_max] += gauss(xx, yy)
+    # Keep only sources whose PSF can contribute to the image
+    r = 3.0 * psf_sigma
+
+    valid = (
+        (x >= -r) & (x < nx + r) &
+        (y >= -r) & (y < ny + r)
+    )
+
+    x = x[valid]
+    y = y[valid]
+    flux = flux[valid]
+
+    # Precompute coordinate offsets for the largest possible stamp
+    radius = int(np.ceil(r))
+    dx = np.arange(-radius, radius + 1)
+    dy = np.arange(-radius, radius + 1)
+
+    DX, DY = np.meshgrid(dx, dy)
+
+    norm = 1.0 / (2.0 * psf_sigma**2)
+
+    for xc, yc, f in zip(x, y, flux):
+        ix = int(xc)
+        iy = int(yc)
+
+        # Local coordinates
+        xx = ix + DX
+        yy = iy + DY
+
+        # Clip to image
+        valid_x = (xx >= 0) & (xx < nx)
+        valid_y = (yy >= 0) & (yy < ny)
+        valid = valid_x & valid_y
+
+        # Gaussian centered at the fractional pixel position
+        gaussian = f * np.exp(
+            -((xx - xc)**2 + (yy - yc)**2) * norm
+        )
+
+        image[yy[valid], xx[valid]] += gaussian[valid]
 
     return image
     
@@ -2327,7 +2651,7 @@ def get_matrice_transformation(cat1,cat2,match1,match2,factor=1,center1=0,center
                 matches.append((match1[i,1],match2[j,1]))
 
     matches = np.array(matches).astype(int)
-
+    breakpoint()
     model_robust, inliers = ransac( (factor*(cat1[matches[:,0],:2]-center1),factor*(cat2[matches[:,1],:2]-center2)), AffineTransform, min_samples=3, residual_threshold=0.5, max_trials=100)
     
     matrice = model_robust.params[:2]

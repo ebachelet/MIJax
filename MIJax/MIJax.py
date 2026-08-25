@@ -12,7 +12,7 @@ from photutils.detection import DAOStarFinder
 from astropy.stats import mad_std
 import numpy as np
 import astropy.units as u
-from astroquery.gaia import Gaia
+from astroquery.vizier import Vizier
 from astropy.io import fits, ascii
 import astropy.wcs as wcs
 from astropy.coordinates import SkyCoord
@@ -2033,7 +2033,7 @@ def refine_psf(image,psf,poses,error,iterations = 20):
     
 #Data access  
 
-def get_Gaia(ref_coord, Gaia_directory, Gaia_name):
+def get_Gaia(ref_coord, Gaia_directory, Gaia_name,size=1.5, limit= 100000):
 
     path = Gaia_directory + Gaia_name
 
@@ -2042,19 +2042,83 @@ def get_Gaia(ref_coord, Gaia_directory, Gaia_name):
 
     except:
 
-        width = u.Quantity(1.5, u.arcmin)
-        height = u.Quantity(1.5, u.arcmin)
+#        width = u.Quantity(size, u.arcmin)
+#        height = u.Quantity(size, u.arcmin)
 
-        Gaia.ROW_LIMIT = 1000
+#        Gaia.ROW_LIMIT = limit
+#        columns = [
+#                "source_id",
+#                "ra",
+#                "dec",
+#                "parallax",
+#                "pmra",
+#                "pmdec",
+#                "phot_g_mean_mag",
+#                "phot_bp_mean_mag",
+#                "phot_rp_mean_mag",
+#                "ruwe",
+#            ]
+#        res_gaia = Gaia.query_object_async(
+#            coordinate=ref_coord,
+#            width=width,
+#            height=height,
+#            columns=columns
+#        )
 
-        res_gaia = Gaia.query_object_async(
-            coordinate=ref_coord,
-            width=width,
-            height=height
+#        res_gaia.write(path, format='ascii.ecsv', overwrite=True)
+               # VizieR query configuration
+        Vizier.ROW_LIMIT = limit
+
+        columns = [
+            "Source",
+            "RA_ICRS",
+            "DE_ICRS",
+            "Plx",
+            "pmRA",
+            "pmDE",
+            "Gmag",
+            "BPmag",
+            "RPmag",
+            "RUWE",
+        ]
+
+        v = Vizier(
+            columns=columns,
+            row_limit=limit
         )
 
-        res_gaia.write(path, format='ascii.ecsv', overwrite=True)
-        
+        # Query a square region
+        result = v.query_region(
+            ref_coord,
+            width=size * u.arcmin,
+            height=size * u.arcmin,
+            catalog="I/355/gaiadr3"
+        )
+
+        if len(result) == 0:
+            return Table()
+
+        res_gaia = result[0]
+
+        # Rename columns to match the Gaia archive output
+        res_gaia.rename_column("Source", "source_id")
+        res_gaia.rename_column("RA_ICRS", "ra")
+        res_gaia.rename_column("DE_ICRS", "dec")
+        res_gaia.rename_column("Plx", "parallax")
+        res_gaia.rename_column("pmRA", "pmra")
+        res_gaia.rename_column("pmDE", "pmdec")
+        res_gaia.rename_column("Gmag", "phot_g_mean_mag")
+        res_gaia.rename_column("BPmag", "phot_bp_mean_mag")
+        res_gaia.rename_column("RPmag", "phot_rp_mean_mag")
+
+        res_gaia.write(path, format="ascii.ecsv", overwrite=True)
+
+    # Mask bad G-band data
+    res_gaia = res_gaia[
+        np.isfinite(res_gaia["phot_g_mean_mag"])
+    ]
+
+    return res_gaia
     #masking bad data    
     res_gaia = res_gaia[np.isfinite(res_gaia['phot_g_mean_mag'])]
     
@@ -2196,6 +2260,8 @@ def crop_images_to_smallest(images):
 
     return cropped_images
     
+    
+    
 def recompute_WCS(init_wcs,gaia_catalog,image,factor=1,psf_size=1,
         threshold_sigma=3,
         peakmax=40000,
@@ -2264,56 +2330,67 @@ def refine_wcs(gaia,img,wcs_img,shift=None,threshold = 1,factor=1,iteration = 5)
     return finalwcs,matche,matches
   
   
-
-  
-  
-def build_image_model(wcs, catalog, shape=(1000, 1000), psf_sigma=1.0,factor=1):
-    """
-    Construct an image model based on WCS and a catalog of RA/Dec positions.
-
-    Parameters
-    ----------
-    wcs : astropy.wcs.WCS
-        WCS object describing the image world coordinate system.
-    catalog : astropy.table.Table
-        Catalog with 'ra' and 'dec' columns in degrees, optionally 'flux'.
-    shape : tuple
-        Shape of the output image (ny, nx).
-    psf_sigma : float
-        Standard deviation of Gaussian PSF in pixels.
-
-    Returns
-    -------
-    image : 2D numpy array
-        Simulated image with sources from catalog.
-    """
+def build_image_model(wcs, catalog, shape=(1000, 1000), psf_sigma=1.0, factor=1):
+    
     ny, nx = shape
-    image = np.zeros((ny, nx), dtype=float)
+    image = np.zeros((ny, nx), dtype=np.float64)
 
-    # Loop through catalog and add Gaussian sources
-    for row in catalog:
-        ra = row['ra']
-        dec = row['dec']
-        flux = row.get('flux', 1.0)  # default flux=1 if not given
+    # Vectorized RA/Dec -> pixel coordinates
+    coords = SkyCoord(
+        ra=np.asarray(catalog["ra"]) * u.deg,
+        dec=np.asarray(catalog["dec"]) * u.deg
+    )
 
-        # Convert RA/Dec to pixel coordinates
-        x, y = wcs.world_to_pixel(SkyCoord(ra=ra*u.deg, dec=dec*u.deg))
-        x *= factor
-        y *= factor
-        
-        # Make sure coordinates are inside image
-        if 0 <= x < nx and 0 <= y < ny:
-            # Define a Gaussian PSF
-            gauss = Gaussian2D(amplitude=flux, x_mean=x, y_mean=y, x_stddev=psf_sigma, y_stddev=psf_sigma)
+    x, y = wcs.world_to_pixel(coords)
+    x *= factor
+    y *= factor
 
-            # Define a small patch around source to evaluate the Gaussian
-            x_min = max(int(x - 3*psf_sigma), 0)
-            x_max = min(int(x + 3*psf_sigma)+1, nx)
-            y_min = max(int(y - 3*psf_sigma), 0)
-            y_max = min(int(y + 3*psf_sigma)+1, ny)
+    # Flux, default = 1
+    try:
+        flux = np.asarray(catalog["flux"], dtype=np.float64)
+    except:
+        flux = np.ones(len(catalog['ra']), dtype=np.float64)*100
 
-            yy, xx = np.mgrid[y_min:y_max, x_min:x_max]
-            image[y_min:y_max, x_min:x_max] += gauss(xx, yy)
+    # Keep only sources whose PSF can contribute to the image
+    r = 3.0 * psf_sigma
+
+    valid = (
+        (x >= -r) & (x < nx + r) &
+        (y >= -r) & (y < ny + r)
+    )
+
+    x = x[valid]
+    y = y[valid]
+    flux = flux[valid]
+
+    # Precompute coordinate offsets for the largest possible stamp
+    radius = int(np.ceil(r))
+    dx = np.arange(-radius, radius + 1)
+    dy = np.arange(-radius, radius + 1)
+
+    DX, DY = np.meshgrid(dx, dy)
+
+    norm = 1.0 / (2.0 * psf_sigma**2)
+
+    for xc, yc, f in zip(x, y, flux):
+        ix = int(xc)
+        iy = int(yc)
+
+        # Local coordinates
+        xx = ix + DX
+        yy = iy + DY
+
+        # Clip to image
+        valid_x = (xx >= 0) & (xx < nx)
+        valid_y = (yy >= 0) & (yy < ny)
+        valid = valid_x & valid_y
+
+        # Gaussian centered at the fractional pixel position
+        gaussian = f * np.exp(
+            -((xx - xc)**2 + (yy - yc)**2) * norm
+        )
+
+        image[yy[valid], xx[valid]] += gaussian[valid]
 
     return image
     
@@ -2327,7 +2404,7 @@ def get_matrice_transformation(cat1,cat2,match1,match2,factor=1,center1=0,center
                 matches.append((match1[i,1],match2[j,1]))
 
     matches = np.array(matches).astype(int)
-
+    breakpoint()
     model_robust, inliers = ransac( (factor*(cat1[matches[:,0],:2]-center1),factor*(cat2[matches[:,1],:2]-center2)), AffineTransform, min_samples=3, residual_threshold=0.5, max_trials=100)
     
     matrice = model_robust.params[:2]
