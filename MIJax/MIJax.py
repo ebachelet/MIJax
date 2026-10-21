@@ -35,8 +35,7 @@ from scipy.ndimage import center_of_mass
 
 
 
-
-class FullImagePSF3:
+class ImagePSF:
 
     def __init__(self, psf_size=21):
         self.size = psf_size
@@ -100,7 +99,7 @@ class FullImagePSF3:
         spliner = RectBivariateSpline(
             x, y,
             psf,
-            kx=3, ky=3, s=0
+            kx=5, ky=5, s=0
         )
 
         return spliner
@@ -156,28 +155,78 @@ class FullImagePSF3:
         positions = []
         positions.append(positions0)
         for i in range(n_iter):
-            cuts, imgs, deltas = [], [] , []
+            cuts, imgs, deltas = [], [], []
+
             for x, y, f in positions[-1]:
             
                 if f <= 0 or not np.isfinite(f):
                     continue
+
                 res = self._extract_cutout(image, x, y)
                 if res is None:
                     continue
+
                 cut, dx, dy = res
-                img = shift(zoom(cut/f,self.oversample,order=5),(-dy*self.oversample,-dx*self.oversample),mode='nearest',order=5)
+                img = shift(
+                    zoom(cut / f, self.oversample, order=5),
+                    (-dy * self.oversample, -dx * self.oversample),
+                    mode='nearest',
+                    order=5
+                )
+
                 imgs.append(img)
                 cuts.append(cut)
                 deltas.append([dx, dy])
+            if len(imgs)<10:
+                breakpoint()
+                continue
+            imgs = np.asarray(imgs)
 
+            # Use previous iteration's PSF to reject outlier pixels
+            if i > 0:
+
+                diff = np.abs(imgs - self.median_psf)
+
+                # Relative threshold, with a small floor to avoid problems
+                # where the PSF is close to zero
+                threshold = 10 * np.maximum(np.abs(self.median_psf), 1e-6)
+
+                mask = diff < threshold
+
+                # Mask rejected pixels rather than throwing away whole images
+                imgs = np.where(mask, imgs, np.nan)
 
             self.cutouts = np.asarray(cuts)
-            self.imgs = np.asarray(imgs)
+            self.imgs = imgs
             self.deltas = np.asarray(deltas)
-            self.median_psf = np.median(self.imgs,axis=0)
 
+            # nanmedian ignores rejected pixels
+            self.median_psf = np.nanmedian(self.imgs, axis=0)
+        
+#        for i in range(n_iter):
+#            cuts, imgs, deltas = [], [] , []
+#            for x, y, f in positions[-1]:
+#            
+#                if f <= 0 or not np.isfinite(f):
+#                    continue
+#                res = self._extract_cutout(image, x, y)
+#                if res is None:
+#                    continue
+#                cut, dx, dy = res
+#                img = shift(zoom(cut/f,self.oversample,order=5),(-dy*self.oversample,-dx*self.oversample),mode='nearest',order=5)
+#                imgs.append(img)
+#                cuts.append(cut)
+#                deltas.append([dx, dy])
+
+
+#            self.cutouts = np.asarray(cuts)
+#            self.imgs = np.asarray(imgs)
+#            self.deltas = np.asarray(deltas)
+#            self.median_psf = np.median(self.imgs,axis=0)
+#            
+#            
             cy, cx = center_of_mass(self.median_psf)
-
+            
             target_y = (self.median_psf.shape[0] - 1) / 2
             target_x = (self.median_psf.shape[1] - 1) / 2
 
@@ -192,11 +241,46 @@ class FullImagePSF3:
             #self.print_quality_metrics(central_region = self.hsize-2)
 
             psfphot2 = psf_photometry(image,self.median_psf,positions[-1], error=sigma,oversample = self.oversample)  
+            SNR = psfphot2['flux_fit']/psfphot2['flux_err']
 
-            positions.append(np.c_[psfphot2['x_fit'],      psfphot2['y_fit'],psfphot2['flux_fit'],])
-            print(positions[-2]/positions[-1])
-            print(np.median(psfphot2['reduced_chi2']))
-            print(psfphot2['qfit'].mean(),psfphot2['qfit'].std(),psfphot2['cfit'].mean(),psfphot2['cfit'].std())
+            quality_fit = np.nanpercentile(psfphot2['reduced_chi2'],75)
+            
+            
+            valid_flags = (psfphot2['flags'] == 0) #& (psfphot2['reduced_chi2']<np.max((2,quality_fit)))
+
+            if not np.any(valid_flags):
+                raise ValueError("No stars passed the basic quality flags.")
+
+            # 2. Dynamic SNR Thresholding (Adaptive to the field)
+            all_valid_snr = SNR[valid_flags]
+            # Adaptively pick a threshold: use the 75th percentile, but clamp it between 15 and 100
+            #dynamic_snr_cutoff = np.clip(np.percentile(all_valid_snr, 75), 15, 100)
+            dynamic_snr_cutoff = 10
+
+            # 3. Spatial Isolation Check (Prevents blended profiles)
+            from scipy.spatial import KDTree
+            coords = np.c_[psfphot2['x_fit'], psfphot2['y_fit']]
+            tree = KDTree(coords)
+            # Find distance to the 2nd nearest neighbor (1st is the star itself)
+            distances, _ = tree.query(coords, k=2)
+            nearest_neighbor_dist = distances[:, 1] 
+
+            min_isolation_distance = 3*2*self.psf_ee_radius() #self.hsize * 2.5 # Rule of thumb
+            isolation_mask = nearest_neighbor_dist > min_isolation_distance
+
+            # 4. Edge Proximity Mask
+            ny, nx = image.shape
+            edge_mask = (
+                (psfphot2['x_fit'] > self.hsize) & 
+                (psfphot2['x_fit'] < nx - self.hsize) &
+                (psfphot2['y_fit'] > self.hsize) & 
+                (psfphot2['y_fit'] < ny - self.hsize)
+            )
+
+            # 5. Combine everything into your final master mask
+            mask = valid_flags & (SNR >= dynamic_snr_cutoff) & isolation_mask & edge_mask
+            positions.append(np.c_[psfphot2['x_fit'],      psfphot2['y_fit'],psfphot2['flux_fit'],][mask])
+
         self.positions = positions
     # ---------------------------------------------------------
     # evaluation helpers
@@ -342,979 +426,6 @@ class FullImagePSF3:
         print(f"Max residual : {max_residual:.3e}")
         print(f"Chi2 / dof   : {chi2_dof:.3f}")
         print(f"FWHM : {2*radius:.3f}")    
-     
-class FullImagePSF2:
-
-    def __init__(self, psf_size=21):
-        self.size = psf_size
-        self.hsize = psf_size // 2
-
-        self.median_psf = None
-        self.spline = None
-        self.epsf_spline = None
-        
-        self.cutouts = None
-        self.positions = None
-
-        self.fluxes = None
-        self.bkgs = None
-        self.deltas = None
-
-        self.rbf = None
-        self.coeffs = None
-        self.ez = None
-        self.ez2 = None
-        self.spliners = None
-        self.pca_mean = None
-        self.pca_basis = None
-        self.pca_models = None
-        self.epsf = None
-    # ---------------------------------------------------------
-    # Cutout extraction
-    # ---------------------------------------------------------
-    def _extract_cutout(self, image, x, y,  max_center_offset=1):
-
-        xi = int(round(x))
-        yi = int(round(y))
-        ny, nx = image.shape
-
-        if xi - self.hsize < 0 or xi + self.hsize >= nx:
-            return None
-        if yi - self.hsize < 0 or yi + self.hsize >= ny:
-            return None
-
-        cut = image[
-            yi - self.hsize:yi + self.hsize + 1,
-            xi - self.hsize:xi + self.hsize + 1
-        ]
-
-        # sanity check: reject bad centering
-        max_pos = np.unravel_index(np.argmax(cut), cut.shape)
-        center = (self.hsize, self.hsize)
-
-        offset = np.hypot(
-            max_pos[0] - center[0],
-            max_pos[1] - center[1]
-        )
-
-        if offset > max_center_offset:
-            return None
-
-        dx = x - xi
-        dy = y - yi
-
-        return cut.copy(), dx, dy
-
-    # ---------------------------------------------------------
-    # PSF spline
-    # ---------------------------------------------------------
-    def _build_spline(self,psf):
-        y = np.arange(psf.shape[0])
-        x = np.arange(psf.shape[1])
-
-        spliner = RectBivariateSpline(
-            y, x,
-            psf,
-            kx=3, ky=3, s=0
-        )
-
-        return spliner
-        
-    # ---------------------------------------------------------
-    # Evaluate shifted PSF
-    # ---------------------------------------------------------
-    def evaluate(self, dx=0.0, dy=0.0):
-
-        # --- RBF path (preferred if trained) ---
-       
-
-      
-        
-        if self.epsf is not None:
-
-            y = np.arange(self.size*self.oversample)
-            x = np.arange(self.size*self.oversample)
-
-
-            psf = self.epsf_spline(y - dy*self.oversample, x - dx*self.oversample)
-            
-            psf = zoom(psf,1/self.oversample,order=0)*self.oversample**2
-            
-        else:
-        
-            y = np.arange(self.size)
-            x = np.arange(self.size)
-
-
-            psf = self.spline(y - dy, x - dx)
-        # --- safety normalization ---
-#        psf = np.clip(psf, 0, None)
-#        s = psf.sum()
-#        if s > 0:
-#            psf /= s
-
-        return psf
-        
-    def get_correction(self, dx, dy):
-
-       A = np.column_stack([
-                    np.ones_like(dx),
-                    dx,
-                    dy,
-                    dx**2,
-                    dx*dy,
-                    dy**2
-                ])
-                
-       r_model = A @ self.coeffs  
-       
-       return r_model
-       
-    def residuals(self, param, im):
-
-        dx, dy, flux, bg = param
-        model = flux * self.evaluate(dx, dy) +bg
-#        dx, dy = param
-#        psf = self.evaluate(dx, dy)
-#        p = psf.ravel()
-#        y = im.ravel()
-
-#        A = np.column_stack([p, np.ones_like(p)])
-
-#        coeff, *_ = np.linalg.lstsq(A, y, rcond=None)
-
-#        flux, bkg = coeff
-#        model = flux * psf + bkg
-#        
-        return (im- model).ravel()/im.ravel()**0.5
-    # ---------------------------------------------------------
-    # Main iterative fit
-    # ---------------------------------------------------------
-    def fit(self, image, positions, n_iter=4, shift_max=0.5):
-
-        positions = np.asarray(positions, float)
-        self.positions = positions
-
-        # -----------------------------
-        # extract cutouts
-        # -----------------------------
-        cuts, deltas = [], []
-
-        for x, y in positions:
-            res = self._extract_cutout(image, x, y)
-            if res is None:
-                continue
-            cut, dx, dy = res
-            cuts.append(cut)
-            deltas.append([dx, dy])
-
-        self.cutouts = np.asarray(cuts)
-        self.deltas = np.asarray(deltas)
-
-        # -----------------------------
-        # initial PSF
-        # -----------------------------
-        self.median_psf = np.median(self.cutouts, axis=0)
-        self.bkg = np.min(self.median_psf)
-
-
-        psf_like = []
-
-        for img in self.cutouts:
-
-
-            # estimate centroid
-            cy, cx = center_of_mass(img)
-            if np.abs(np.array(cx,cy)-15)>2:
-                continue
-            # shift to image centre
-            dy = (img.shape[0] - 1) / 2 - cy
-            dx = (img.shape[1] - 1) / 2 - cx
-
-            img = shift(img, (dy, dx), order=0, mode="nearest")
-            #img += -np.min(img)+0.1
-            #img /= img.sum()
-            psf_like.append(img)
-
-    
-        #psf_like = [i-np.min(i)+10**-10 for i in self.cutouts]
-        psf_like = [i-np.min(i)+10**-10 for i in psf_like]
-        psf_like = [i/i.sum() for i in psf_like]
-        self.median_psf = np.median(psf_like, axis=0)
-        self.median_psf = np.clip(self.median_psf, 0, None)
-
-        s = self.median_psf.sum()
-        if s > 0:
-            self.median_psf /= s
-            
-        cy, cx = center_of_mass(self.median_psf)
-
-        target_y = (self.median_psf.shape[0] - 1) / 2
-        target_x = (self.median_psf.shape[1] - 1) / 2
-
-        self.median_psf = shift(
-        self.median_psf,
-        (target_y - cy, target_x - cx),
-        order=3,
-        mode="nearest",
-        )
-
-        self.median_psf = np.clip(self.median_psf, 0, None)
-        self.median_psf /= self.median_psf.sum()
-        self.spline = self._build_spline(self.median_psf)
-        
-        self.good_cutouts = self.cutouts.copy()
-        goodcuts2 = self.cutouts.copy()
-        self.oversample = 2
-        # =====================================================
-        # ITERATION LOOP (EM style)
-        # =====================================================
-        for it in range(n_iter):
-
-            res_list = []
-            DX, DY = [], []
-
-            bkgs = []
-            fluxes = []
-            shifted = []
-            goodcuts = goodcuts2.copy()
-            goodcuts2 = [] 
-            epsfs = []
-            # -------------------------
-            # E-step
-            # -------------------------
-            for cut in self.cutouts:
-                try:
-                    dy,dx = phase_cross_correlation(cut,self.evaluate(0,0),upsample_factor=1000)[0]
-                    p0 = [dx, dy, (cut-self.bkg).sum(), self.bkg]
-
-                    res = least_squares(
-                        self.residuals,
-                        p0,
-                        args=((cut,)),
-                        method='lm'      # or 'trf'
-                    )
-
-                    dx,dy,flux,bkg = res.x
-                    
-
-    #                psf = self.evaluate(dx, dy)
-    #                p = psf.ravel()
-    #                y = cut.ravel()
-
-    #                A = np.column_stack([p, np.ones_like(p)])
-
-    #                coeff, *_ = np.linalg.lstsq(A, y, rcond=None)
-
-    #                flux, bkg = coeff
-
-                    #if (np.max(np.abs((dx,dy)))>1):# | (np.abs(bkg-30)>20):
-                    #    continue
-                        
-
-                    DX.append(dx)
-                    DY.append(dy)
-
-                    goodcuts2.append(cut)
-                    bkgs.append(bkg)
-                    fluxes.append(flux)
-                    #epsf0 = shift(zoom((cut-bkg)/flux,self.oversample),(-dy*self.oversample,-dx*self.oversample))
-                    #epsf0 = np.clip(epsf0, 0, None)
-                    #epsfs.append(epsf0/epsf0.sum())
-                    shifted_epsf = shift(zoom(cut,self.oversample,order=0),(-dy*self.oversample,-dx*self.oversample),mode='nearest',order=3)
-                    #shifted_epsf = shift(zoom((cut-bkg)/flux,self.oversample),(-dy*self.oversample,-dx*self.oversample))
-                    shifted_epsf = np.clip(shifted_epsf,0,None)
-                    epsfs.append(shifted_epsf)
-                    #reso = shift((cut-bkg)/flux,(-dy,-dx),mode='nearest',order=5)
-                    reso = shift(cut,(-dy,-dx),mode='nearest',order=0)
-                    reso = np.clip(reso,0,None)
-                    #reso = shift(cut,(-dy,-dx),mode='nearest')
-                    res_list.append(reso)
-                except:
-                    pass
-            
-            # -------------------------
-            # safety check
-            # -------------------------
-            if len(goodcuts2) < 5:
-                print(f"Iter {it}: too few stars")
-                break
-
-    
-            DX = np.asarray(DX)
-            DY = np.asarray(DY)
-            self.DX = DX
-            self.DY = DY
-            self.fluxes = fluxes
-            self.bkgs = bkgs
-
-
-            self.epsf = np.median(epsfs, axis=0)
-            self.epsf_bkg = np.min(self.epsf)
-        
-            psf_like = [i-np.min(i)+10**-10 for i in epsfs]
-            #psf_like = epsfs
-            psf_like = [i/i.sum() for i in psf_like]
-
-            self.epsf = np.median(psf_like, axis=0)
-            self.epsf = np.clip(self.epsf, 0, None)
-
-            self.epsf /= self.epsf.sum()
-            self.epsf *= self.oversample**2
-
-            cy, cx = center_of_mass(self.epsf)
-            print(cx,cy)
-            target_y = (self.epsf.shape[0] - 1) / 2
-            target_x = (self.epsf.shape[1] - 1) / 2
-
-            self.epsf = shift(
-                self.epsf,
-                (target_y - cy, target_x - cx),
-                order=3,
-                mode="nearest",
-            )
-
-            self.epsf = np.clip(self.epsf, 0, None)
-            self.epsf /= self.epsf.sum()
-
-            self.epsf_spline = self._build_spline(self.epsf)
-##            #print(it,len(goodcuts2),np.mean(bkgs))
-#            print(it,len(goodcuts2),
-#                    np.mean(bkgs),
-#                    np.mean(fluxes),
-#                    np.median(self.epsf[0]),
-#                    np.median(self.epsf[-1]),
-#                    self.epsf.sum(),
-#                )
-
-#            #breakpoint()
-#            #from scipy.interpolate import RBFInterpolator
-#            #self.rbf = RBFInterpolator(DX,DY,np.array(res_list).ravel())
-#            
-#            A = np.column_stack([
-#            # order 0
-#            np.ones_like(DX),
-
-#            # order 1
-#            DX,
-#            DY,
-
-#            # order 2
-#            DX**2,
-#            DX*DY,
-#            DY**2,
-
-#            # order 3
-#            DX**3,
-#            DX**2 * DY,
-#            DX * DY**2,
-#            DY**3,])
-
-
-#            Y = np.array(res_list).reshape(len(DX), -1)
-
-#            coeffs, *_ = np.linalg.lstsq(A, Y, rcond=None)
-#            self.coeffs = coeffs
-
-            goodcuts = goodcuts2
-            self.good_cutouts = goodcuts
-            self.median_psf = np.median(res_list, axis=0)
-
-            self.bkg = np.min(self.median_psf)
-
-            psf_like = [i-np.min(i)+10**-10 for i in res_list]
-            #psf_like = res_list
-            psf_like = [i/i.sum() for i in psf_like]
-
-            self.median_psf = np.median(psf_like, axis=0)
-            self.median_psf = np.clip(self.median_psf, 0, None)
-
-            s = self.median_psf.sum()
-            if s > 0:
-                self.median_psf /= s
-            cy, cx = center_of_mass(self.median_psf)
-            #print(cx,cy)
-            target_y = (self.median_psf.shape[0] - 1) / 2
-            target_x = (self.median_psf.shape[1] - 1) / 2
-
-            self.median_psf = shift(
-            self.median_psf,
-            (target_y - cy, target_x - cx),
-            order=1,
-            mode="nearest",
-            )
-            print(it,len(goodcuts2),np.mean(bkgs),cx,cy)
-            self.median_psf = np.clip(self.median_psf, 0, None)
-            self.median_psf /= self.median_psf.sum()
-            self.spline = self._build_spline(self.median_psf)
-            self.print_quality_metrics(central_region = self.hsize/2)
-            
-    # ---------------------------------------------------------
-    # evaluation helpers
-    # ---------------------------------------------------------
-    def evaluate_shift(self, dx, dy):
-        ix = int(np.round(dx))
-        iy = int(np.round(dy))
-
-        fx = dx - ix
-        fy = dy - iy
-
-        # fractional shift via spline
-        psf = self.evaluate(fx, fy)
-
-        ny, nx = psf.shape
-        out = np.zeros_like(psf)
-
-        # source slice
-        sx0 = max(0, -ix)
-        sx1 = min(nx, nx - ix)
-        sy0 = max(0, -iy)
-        sy1 = min(ny, ny - iy)
-
-        # destination slice
-        dx0 = max(0, ix)
-        dx1 = dx0 + (sx1 - sx0)
-        dy0 = max(0, iy)
-        dy1 = dy0 + (sy1 - sy0)
-
-        out[dy0:dy1, dx0:dx1] = psf[sy0:sy1, sx0:sx1]
-
-        # renormalize (important after clipping edges)
-        s = out.sum()
-        if s > 0:
-            out /= s
-
-        return out
-        
-         
-    def psf_ee_radius(self, frac=0.5):
-        """
-        Encircled-energy radius of a 2D PSF.
-
-        Parameters
-        ----------
-        psf : 2D array
-            PSF stamp
-        frac : float
-            Fraction of total flux (e.g. 0.5 = EE50)
-
-        Returns
-        -------
-        r_frac : float
-            Radius enclosing given flux fraction (in pixels)
-        """
-
-        psf = np.array(self.median_psf, dtype=float)
-
-        # background subtraction
-        psf = psf - np.median(psf)
-        psf[psf < 0] = 0
-
-        # center on peak
-        y0, x0 = np.unravel_index(np.argmax(psf), psf.shape)
-
-        y, x = np.indices(psf.shape)
-        r = np.sqrt((x - x0)**2 + (y - y0)**2)
-
-        # flatten and sort by radius
-        r_flat = r.ravel()
-        f_flat = psf.ravel()
-
-        order = np.argsort(r_flat)
-        r_sorted = r_flat[order]
-        f_sorted = f_flat[order]
-
-        cumsum = np.cumsum(f_sorted)
-        total = cumsum[-1]
-
-        if total <= 0:
-            return np.nan
-
-        target = frac * total
-
-        return np.interp(target, cumsum, r_sorted)
-    # ---------------------------------------------------------
-    # Diagnostics
-    # ---------------------------------------------------------
-    def print_quality_metrics(self,central_region=8):
-        residual_sq_sum = 0
-        max_residual = 0
-        chi2 = 0
-        ndof = 0
-        nstars = 0
-        npix = self.size * self.size
-        radius = self.psf_ee_radius()
-        central_region = int(central_region)
-        for cut in self.good_cutouts:
-           
-
-            p0 = [0, 0, (cut-self.bkg).sum(), self.bkg]
-
-            res = least_squares(
-                self.residuals,
-                p0,
-                args=((cut,)),
-                method='lm'      # or 'trf'
-            )
-            
-            dx,dy,flux,bkg = res.x
-            psf = self.evaluate(dx, dy)
-            
-            residual = cut - flux*psf-bkg
-            residual = residual[central_region:-central_region,central_region:-central_region]
-            residual_sq_sum += np.sum(residual**2)
-            max_residual = max(max_residual, np.max(np.abs(residual)))
-
-            sigma = np.sqrt(cut[central_region:-central_region,central_region:-central_region])
-            chi2 += np.sum((residual**2) / sigma**2)
-            ndof += npix - 1
-
-            nstars += 1
-
-        if nstars == 0:
-            print("No stars for diagnostics")
-            return
-
-        rms = np.sqrt(residual_sq_sum / (nstars * npix))
-        chi2_dof = chi2 / ndof if ndof > 0 else np.nan
-
-        print("\nPSF QUALITY METRICS")
-        print("-------------------")
-        print(f"Stars used   : {nstars}")
-        print(f"RMS residual : {rms:.3e}")
-        print(f"Max residual : {max_residual:.3e}")
-        print(f"Chi2 / dof   : {chi2_dof:.3f}")
-        print(f"FWHM : {2*radius:.3f}")    
-        
-        
-class FullImagePSF:
-    def __init__(self, psf_size=21):
-        self.size = psf_size
-        self.hsize = psf_size // 2
-        self.median_psf = None
-        self.spline = None
-
-    # ---------------------------------------------------------
-    # Cutout extraction
-    # ---------------------------------------------------------
-    def _extract_cutout(self, image, x, y, max_center_offset=1):
-        xi = int(round(x))
-        yi = int(round(y))
-        ny, nx = image.shape
-
-        if xi - self.hsize < 0 or xi + self.hsize >= nx:
-            return None
-        if yi - self.hsize < 0 or yi + self.hsize >= ny:
-            return None
-
-        cut = image[
-            yi - self.hsize:yi + self.hsize + 1,
-            xi - self.hsize:xi + self.hsize + 1
-        ]
-
-        max_pos = np.unravel_index(np.argmax(cut), cut.shape)
-        center = (self.hsize, self.hsize)
-
-        offset = np.sqrt(
-            (max_pos[0] - center[0])**2 +
-            (max_pos[1] - center[1])**2
-        )
-
-        if offset > max_center_offset:
-            return None
-
-        dx = x - xi
-        dy = y - yi
-
-        return cut.copy(), dx, dy
-
-    # ---------------------------------------------------------
-    # Background subtraction + normalization
-    # ---------------------------------------------------------
-    def _normalize_cutout(self, cut):
-        edge = np.concatenate([
-            cut[0, :], cut[-1, :], cut[:, 0], cut[:, -1]
-        ])
-
-        bkg = np.median(edge)
-        
-        cut = cut - bkg
-        cut[cut < 0] = 0
-        
-        flux = cut.sum()
-        if flux <= 0:
-            return None
-
-        cut = cut / flux
-       
-
-
-        return cut
-
-    # ---------------------------------------------------------
-    # Build PSF model
-    # ---------------------------------------------------------
-    def _build_psf(self, cutouts):
-    
-        self.median_psf = np.median(cutouts, axis=0)
-        self.coeffs = None
-
-        y = np.arange(self.size)
-        x = np.arange(self.size)
-
-        self.spline = RectBivariateSpline(
-            y, x, self.median_psf, kx=5, ky=5, s=0
-        )
-        from skimage.registration import phase_cross_correlation
-        res = []
-        DX = []
-        DY = []
-        for ind,cut in enumerate(self.cutouts):
-               dy,dx =  phase_cross_correlation(self.median_psf,cut,upsample_factor=100)[0]
-               momo = self.spline(y+dy,x+dx)
-               flux,bkg = np.polyfit(momo.ravel(),cut.ravel(),1)
-               
-               resi = (cut-bkg)/flux-momo
-               
-               res.append(resi)
-               DX.append(dx)
-               DY.append(dy)
-              
-        residuals = np.asarray(res)
-        self.residuals = residuals
-        DX = np.asarray(DX)
-        DY = np.asarray(DY)
-        A = np.column_stack([
-            # order 0
-            np.ones_like(DX),
-
-            # order 1
-            DX,
-            DY,
-
-            # order 2
-            DX**2,
-            DX*DY,
-            DY**2,
-
-            # order 3
-            DX**3,
-            DX**2 * DY,
-            DX * DY**2,
-            DY**3,])
-
-#            # order 4
-#            DX**4,
-#            DX**3 * DY,
-#            DX**2 * DY**2,
-#            DX * DY**3,
-#            DY**4,
-
-#            # order 5
-#            DX**5,
-#            DX**4 * DY,
-#            DX**3 * DY**2,
-#            DX**2 * DY**3,
-#            DX * DY**4,
-#            DY**5,
-#        ])
-        Y = residuals.reshape(len(DX), -1)
-
-        coeffs, *_ = np.linalg.lstsq(A, Y, rcond=None)
-        self.coeffs = coeffs
-
-    # ---------------------------------------------------------
-    # Evaluate PSF
-    # ---------------------------------------------------------
-    def evaluate(self, dx, dy):
-        y = np.arange(self.size) - dy
-        x = np.arange(self.size) - dx
-
-        psf = self.spline(y, x)
-       
-
-        try:
-                
-                v = np.array([
-                    # order 0
-                    1,
-
-                    # order 1
-                    dx,
-                    dy,
-
-                    # order 2
-                    dx**2,
-                    dx * dy,
-                    dy**2,
-
-                    # order 3
-                    dx**3,
-                    dx**2 * dy,
-                    dx * dy**2,
-                    dy**3,])
-
-#                    # order 4
-#                    dx**4,
-#                    dx**3 * dy,
-#                    dx**2 * dy**2,
-#                    dx * dy**3,
-#                    dy**4,
-
-#                    # order 5
-#                    dx**5,
-#                    dx**4 * dy,
-#                    dx**3 * dy**2,
-#                    dx**2 * dy**3,
-#                    dx * dy**4,
-#                    dy**5,
-#                ])
-
-                correction = v @ self.coeffs
-
-                correction = correction.reshape(int(len(correction)**0.5),int(len(correction)**0.5))
-                
-        except:
-                correction = 0
-
-
-          
-        self.correction = np.zeros(psf.shape)
-        self.correction = correction
-        psf += self.correction
-        psf[psf < 0] = 0
-        s = psf.sum()
-        if s > 0:
-            psf /= s
-        return psf
-    # ---------------------------------------------------------
-    # Evaluate PSF with integer + fractional shift
-    # ---------------------------------------------------------
-    def evaluate_shift(self, dx, dy):
-        """
-        Shift PSF by (dx, dy) including integer pixel shifts.
-        This avoids spline evaluation far from center.
-        """
-
-        ix = int(np.round(dx))
-        iy = int(np.round(dy))
-
-        fx = dx - ix
-        fy = dy - iy
-
-        # fractional shift via spline
-        psf = self.evaluate(fx, fy)
-
-        ny, nx = psf.shape
-        out = np.zeros_like(psf)
-
-        # source slice
-        sx0 = max(0, -ix)
-        sx1 = min(nx, nx - ix)
-        sy0 = max(0, -iy)
-        sy1 = min(ny, ny - iy)
-
-        # destination slice
-        dx0 = max(0, ix)
-        dx1 = dx0 + (sx1 - sx0)
-        dy0 = max(0, iy)
-        dy1 = dy0 + (sy1 - sy0)
-
-        out[dy0:dy1, dx0:dx1] = psf[sy0:sy1, sx0:sx1]
-
-        # renormalize (important after clipping edges)
-        s = out.sum()
-        if s > 0:
-            out /= s
-
-        return out
-    # ---------------------------------------------------------
-    # Refine star position
-    # ---------------------------------------------------------
-    def refine_position(self, image, x, y, max_iter=5, step_scale=0.3):
-        for _ in range(max_iter):
-            res = self._extract_cutout(image, x, y)
-            if res is None:
-                break
-
-            cut, dx, dy = res
-            star = self._normalize_cutout(cut)
-            if star is None:
-                break
-
-            psf = self.evaluate(dx, dy)
-
-            eps = 1e-2
-            psf_dx = (self.evaluate(dx + eps, dy) - psf) / eps
-            psf_dy = (self.evaluate(dx, dy + eps) - psf) / eps
-
-            residual = star - psf
-
-            dpx = -np.sum(residual * psf_dx)
-            dpy = -np.sum(residual * psf_dy)
-
-            # stabilize updates
-            dpx = np.clip(dpx, -0.5, 0.5)
-            dpy = np.clip(dpy, -0.5, 0.5)
-
-            x += step_scale * dpx
-            y += step_scale * dpy
-
-        return x, y
-
-    # ---------------------------------------------------------
-    # Main fit with iteration
-    # ---------------------------------------------------------
-    def fit(self, image, positions, n_iter=5, tol=1e-4):
-        positions = np.array(positions, dtype=float)
-        self.positions = positions.copy()
-        for it in range(n_iter):
-            print(f"\nIteration {it+1}/{n_iter}")
-
-            cutouts = []
-            deltas = []
-            valid_idx = []
-
-            # --- extract + normalize ---
-            for i, (x, y) in enumerate(self.positions):
-                res = self._extract_cutout(image, x, y)
-                if res is None:
-                    continue
-
-                cut, dx, dy = res
-                cut = self._normalize_cutout(cut)
-
-                if cut is None:
-                    continue
-
-                cutouts.append(cut)
-                deltas.append([dx,dy])
-                valid_idx.append(i)
-
-            if len(cutouts) == 0:
-                raise ValueError("No valid stars for PSF")
-
-            cutouts = np.array(cutouts)
-            self.cutouts = cutouts
-            self.deltas = np.array(deltas)
-            self._build_psf(cutouts)
-
-            print(f"PSF built with {len(cutouts)} stars")
-
-            # --- refine positions ---
-            shifts = []
-
-            for i in valid_idx:
-                x_old, y_old = positions[i]
-                x_new, y_new = self.refine_position(image, x_old, y_old)
-
-                shifts.append(np.hypot(x_new - x_old, y_new - y_old))
-                positions[i] = [x_new, y_new]
-
-            mean_shift = np.mean(shifts) if shifts else 0
-            print(f"Mean position shift: {mean_shift:.4e} px")
-
-            if mean_shift < tol:
-                print("Converged")
-                break
-
-        self.positions = positions
-        self.print_quality_metrics(image, positions)
-        
-    def psf_ee_radius(self, frac=0.5):
-        """
-        Encircled-energy radius of a 2D PSF.
-
-        Parameters
-        ----------
-        psf : 2D array
-            PSF stamp
-        frac : float
-            Fraction of total flux (e.g. 0.5 = EE50)
-
-        Returns
-        -------
-        r_frac : float
-            Radius enclosing given flux fraction (in pixels)
-        """
-
-        psf = np.array(self.median_psf, dtype=float)
-
-        # background subtraction
-        psf = psf - np.median(psf)
-        psf[psf < 0] = 0
-
-        # center on peak
-        y0, x0 = np.unravel_index(np.argmax(psf), psf.shape)
-
-        y, x = np.indices(psf.shape)
-        r = np.sqrt((x - x0)**2 + (y - y0)**2)
-
-        # flatten and sort by radius
-        r_flat = r.ravel()
-        f_flat = psf.ravel()
-
-        order = np.argsort(r_flat)
-        r_sorted = r_flat[order]
-        f_sorted = f_flat[order]
-
-        cumsum = np.cumsum(f_sorted)
-        total = cumsum[-1]
-
-        if total <= 0:
-            return np.nan
-
-        target = frac * total
-
-        return np.interp(target, cumsum, r_sorted)
-    # ---------------------------------------------------------
-    # Diagnostics
-    # ---------------------------------------------------------
-    def print_quality_metrics(self, image, positions):
-        residual_sq_sum = 0
-        max_residual = 0
-        chi2 = 0
-        ndof = 0
-        nstars = 0
-        npix = self.size * self.size
-        radius = self.psf_ee_radius()
-        for x, y in positions:
-            res = self._extract_cutout(image, x, y)
-            if res is None:
-                continue
-
-            cut, dx, dy = res
-            star = self._normalize_cutout(cut)
-            if star is None:
-                continue
-
-            psf = self.evaluate(dx, dy)
-            residual = star - psf
-
-            residual_sq_sum += np.sum(residual**2)
-            max_residual = max(max_residual, np.max(np.abs(residual)))
-
-            sigma = np.sqrt(np.maximum(cut, 1e-6))
-            chi2 += np.sum((residual**2) / sigma**2)
-            ndof += npix - 1
-
-            nstars += 1
-
-        if nstars == 0:
-            print("No stars for diagnostics")
-            return
-
-        rms = np.sqrt(residual_sq_sum / (nstars * npix))
-        chi2_dof = chi2 / ndof if ndof > 0 else np.nan
-
-        print("\nPSF QUALITY METRICS")
-        print("-------------------")
-        print(f"Stars used   : {nstars}")
-        print(f"RMS residual : {rms:.3e}")
-        print(f"Max residual : {max_residual:.3e}")
-        print(f"Chi2 / dof   : {chi2_dof:.3f}")
-        print(f"FWHM : {2*radius:.3f}")
-
 
 
 
@@ -1983,7 +1094,7 @@ def psf_photometry(image,psf,guess, error= None,n_odd=5, oversample = 1):
     #psf_model.y_0.fixed = True
     psf_phot = PSFPhotometry(
     psf_model=psf_model,
-    fitter=LevMarLSQFitter(),xy_bounds = [0.5,0.5],
+    fitter=LevMarLSQFitter(),xy_bounds = [1,1],
     fit_shape=n_odd, progress_bar=True,
     )
 
@@ -2261,34 +1372,347 @@ def crop_images_to_smallest(images):
     return cropped_images
     
     
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.optimize import differential_evolution
+from scipy.optimize import linear_sum_assignment
+
+
+def optimize_affine_matching(
+    gaia_xy,
+    detected_xy,
+    radius=1.0,
+    rotation_range=5.0,
+    translation_range=200.0,
+    scale_range=0.2,
+    seed=42,
+):
+    """
+    Optimise une transformation affine pour maximiser le nombre
+    de correspondances uniques dans un rayon donné.
+
+    gaia_xy : positions Gaia projetées par la WCS initiale
+    detected_xy : positions des étoiles détectées
+    radius : seuil de correspondance en pixels
+    rotation_range : rotation maximale recherchée, en degrés
+    translation_range : translation maximale recherchée, en pixels
+    scale_range : variation d'échelle autorisée autour de 1
+    """
+
+    gaia_xy = np.asarray(gaia_xy, dtype=float)
+    detected_xy = np.asarray(detected_xy, dtype=float)
+
+    gaia_xy = gaia_xy[np.isfinite(gaia_xy).all(axis=1)]
+    detected_xy = detected_xy[np.isfinite(detected_xy).all(axis=1)]
+
+    tree = cKDTree(detected_xy)
+
+    # Paramètres :
+    # [a, b, c, d, tx, ty]
+    # x' = a*x + b*y + tx
+    # y' = c*x + d*y + ty
+
+    def score(params):
+        a, b, c, d, tx, ty = params
+
+        transformed = gaia_xy @ np.array([
+            [a, c],
+            [b, d]
+        ]) + np.array([tx, ty])
+
+        distances, indices = tree.query(
+            transformed,
+            distance_upper_bound=radius
+        )
+
+        valid = indices < len(detected_xy)
+
+        # Pénaliser les distances tout en maximisant les matches
+        pairs = sorted(
+            zip(distances[valid], np.where(valid)[0], indices[valid])
+        )
+
+        used_gaia = set()
+        used_detected = set()
+        n_matches = 0
+        total_dist = 0
+
+        for dist, gi, di in pairs:
+            if gi not in used_gaia and di not in used_detected:
+                used_gaia.add(gi)
+                used_detected.add(di)
+                n_matches += 1
+                total_dist += dist
+
+        return -n_matches + 1e-3 * total_dist
+
+    bounds = [
+        (1-scale_range, 1+scale_range),  # a
+        (-scale_range, scale_range),     # b
+        (-scale_range, scale_range),     # c
+        (1-scale_range, 1+scale_range),  # d
+        (-translation_range, translation_range),  # tx
+        (-translation_range, translation_range),  # ty
+    ]
+
+    result = differential_evolution(
+        score,
+        bounds,
+        seed=seed,
+        maxiter=500,
+        popsize=15,
+        polish=False,
+        atol=0.1
+    )
+
+    a, b, c, d, tx, ty = result.x
+
+    matrix = np.array([
+        [a, b, tx],
+        [c, d, ty],
+        [0, 0, 1]
+    ])
+
+    transformed = gaia_xy @ matrix[:2, :2].T + matrix[:2, 2]
+
+    distances, indices = tree.query(
+        transformed,
+        distance_upper_bound=radius
+    )
+
+    valid = indices < len(detected_xy)
+
+    candidates = sorted(
+        zip(distances[valid], np.where(valid)[0], indices[valid])
+    )
+
+    used_gaia = set()
+    used_detected = set()
+    matches = []
+
+    for dist, gi, di in candidates:
+        if gi not in used_gaia and di not in used_detected:
+            used_gaia.add(gi)
+            used_detected.add(di)
+            matches.append((gi, di, dist))
+
+    matches = np.asarray(matches)
+
+    return matrix, matches, -result.fun
+    
+    
+def refine_affine_ransac(
+    gaia_xy,
+    detected_xy,
+    matrix,
+    radius=1.0,
+    residual_threshold=1.0,
+    max_trials=2000,
+):
+    """
+    Raffine une transformation affine initiale avec RANSAC.
+
+    Parameters
+    ----------
+    gaia_xy : ndarray (N, 2)
+        Positions Gaia projetées en pixels.
+    detected_xy : ndarray (M, 2)
+        Positions des étoiles détectées.
+    matrix : ndarray (3, 3)
+        Transformation affine initiale.
+    radius : float
+        Rayon maximal pour associer deux étoiles, en pixels.
+    residual_threshold : float
+        Seuil des résidus RANSAC, en pixels.
+    max_trials : int
+        Nombre maximal d'itérations RANSAC.
+
+    Returns
+    -------
+    model : AffineTransform
+        Transformation affine raffinée.
+    matches : ndarray (K, 3)
+        Indices Gaia, indices détection et distances.
+    """
+
+    gaia_xy = np.asarray(gaia_xy, dtype=float)
+    detected_xy = np.asarray(detected_xy, dtype=float)
+
+    # Supprimer les positions invalides en conservant les indices d'origine
+    valid_g = np.isfinite(gaia_xy).all(axis=1)
+    valid_d = np.isfinite(detected_xy).all(axis=1)
+
+    gaia_indices = np.flatnonzero(valid_g)
+    detected_indices = np.flatnonzero(valid_d)
+
+    gaia = gaia_xy[valid_g]
+    detected = detected_xy[valid_d]
+
+    # Appliquer la transformation affine initiale
+    predicted = (
+        gaia @ matrix[:2, :2].T
+        + matrix[:2, 2]
+    )
+
+    # Recherche des correspondances candidates
+    tree = cKDTree(detected)
+    neighborhoods = tree.query_ball_point(predicted, radius)
+
+    candidates = []
+
+    for gi, neighbors in enumerate(neighborhoods):
+        for di in neighbors:
+            dist = np.linalg.norm(predicted[gi] - detected[di])
+            candidates.append((dist, gi, di))
+
+    # Apparier les étoiles de manière unique
+    candidates.sort()
+
+    used_g = set()
+    used_d = set()
+    pairs = []
+
+    for dist, gi, di in candidates:
+        if gi not in used_g and di not in used_d:
+            used_g.add(gi)
+            used_d.add(di)
+            pairs.append((gi, di))
+
+    pairs = np.asarray(pairs, dtype=int)
+
+    if len(pairs) < 3:
+        raise RuntimeError(
+            f"Seulement {len(pairs)} correspondances candidates."
+        )
+
+    # RANSAC : estimer l'affine à partir des correspondances candidates
+    model, inliers = ransac(
+        (
+            gaia[pairs[:, 0]],
+            detected[pairs[:, 1]]
+        ),
+        AffineTransform,
+        min_samples=3,
+        residual_threshold=residual_threshold,
+        max_trials=max_trials,
+        rng=np.random.default_rng(42),
+    )
+
+    if model is None or inliers is None or inliers.sum() < 3:
+        raise RuntimeError("RANSAC n'a pas trouvé de transformation fiable.")
+
+    # Recalculer les correspondances avec la transformation raffinée
+    predicted = model(gaia)
+
+    neighborhoods = tree.query_ball_point(predicted, radius)
+    candidates = []
+
+    for gi, neighbors in enumerate(neighborhoods):
+        for di in neighbors:
+            dist = np.linalg.norm(predicted[gi] - detected[di])
+            candidates.append((dist, gi, di))
+
+    candidates.sort()
+
+    used_g = set()
+    used_d = set()
+    matches = []
+
+    for dist, gi, di in candidates:
+        if gi not in used_g and di not in used_d:
+            used_g.add(gi)
+            used_d.add(di)
+
+            matches.append((
+                gaia_indices[gi],
+                detected_indices[di],
+                dist
+            ))
+
+    return model, np.asarray(matches)
+    
     
 def recompute_WCS(init_wcs,gaia_catalog,image,factor=1,psf_size=1,
         threshold_sigma=3,
         peakmax=40000,
         min_separation=1):
 
-        if factor>=2:
-            shift = [0,0]
-        else:
-        
-            mod = build_image_model(init_wcs,gaia_catalog, shape=image.shape, psf_sigma=factor,factor=factor)
-            shift, error, diffphase = phase_cross_correlation(mod, image,upsample_factor=100)    
-        
+
         star_positions,full_catalog, bkg = detect_stars(image, psf_size,threshold_sigma=threshold_sigma,
         peakmax=peakmax,
-        min_separation=min_separation)           
-        newcs,match,match_tot = refine_wcs(gaia_catalog,star_positions[:,:2][-2000:]-0.5,init_wcs,shift=shift[::-1],factor=factor,threshold=1,iteration=5)
+        min_separation=min_separation)  
+        
+        if factor>=2:
+            #shift = [0,0]
+            matrix = None
+        else:
+        
+            #mod = build_image_model(init_wcs,gaia_catalog, shape=image.shape, psf_sigma=factor,factor=factor)
+            #shift, error, diffphase = phase_cross_correlation(mod, image,upsample_factor=100)    
+            
+            radec = init_wcs.pixel_to_world(star_positions[:,0],star_positions[:,1])
+            
+            #gaia = np.column_stack((gaia_catalog['ra'].value,gaia_catalog['dec'].value))
+            order = gaia_catalog['phot_g_mean_mag'].argsort().value[::-1]
+            #gaia = gaia[order]
+
+            # Project Gaia into the initial WCS pixel coordinates
+            gaia_coords = init_wcs.world_to_pixel(SkyCoord( gaia_catalog['ra'][order],gaia_catalog['dec'][order]))
+
+
+            gaia_xy = np.column_stack(gaia_coords)
+
+            # Detected star positions
+            cat_xy = star_positions[:, :2]
+            gaia_coords = init_wcs.world_to_pixel(
+            SkyCoord(
+            ra=gaia_catalog["ra"],
+            dec=gaia_catalog["dec"]
+            )
+            )
+
+            gaia_xy = np.column_stack(gaia_coords)
+            detected_xy = star_positions[:, :2]
+
+            matrix, matches, score = optimize_affine_matching(
+            gaia_xy,
+            detected_xy,
+            radius=1.0,
+            rotation_range=5,
+            translation_range=20,
+            scale_range=0.02
+            )
+
+            model, matches_refined = refine_affine_ransac(
+            gaia_xy,
+            detected_xy,
+            matrix,
+            radius=1.0,
+            residual_threshold=1.0
+            )
+
+            print("Transformation raffinée :")
+            print(model.params)
+
+            print("Correspondances initiales :", len(matches))
+            print("Correspondances raffinées :", len(matches_refined))
+
+            #model_robust, inliers = ransac((gaia_xy[-500:,],cat_xy[-500:,]), AffineTransform,  min_samples=3, residual_threshold=2.0, max_trials=1000)
+            matrix = np.linalg.pinv(model.params)
+
+        newcs,match,match_tot = refine_wcs(gaia_catalog,star_positions[:,:2][-2000:]-0.5,init_wcs,transform=matrix,factor=factor,threshold=1,iteration=5)
         indexes = np.arange(0,len(star_positions)).astype(int)[-2000:]
         match[:,1] = indexes[match[:,1]]
 
         return newcs,shift,match,star_positions
         
-def refine_wcs(gaia,img,wcs_img,shift=None,threshold = 1,factor=1,iteration = 5):
+def refine_wcs(gaia,img,wcs_img,transform=None,threshold = 1,factor=1,iteration = 5):
     
     wc = wcs_img
     img2 = img.copy()
-    if shift is not None:
-        img2 += shift
+    if transform is not None:
+
+        img2 = img2 @ transform[:2, :2].T + transform[:2, 2]
         
     for i in range(iteration):
     
@@ -2306,15 +1730,16 @@ def refine_wcs(gaia,img,wcs_img,shift=None,threshold = 1,factor=1,iteration = 5)
         valid = idx < len(img2)  # only matched stars
         matches = np.column_stack([np.arange(len(pixels))[valid], idx[valid],dist[valid]])
         matche = np.column_stack([np.arange(len(pixels))[valid], idx[valid]])
-
         try:
-        
-            new_wcs = fit_wcs_from_points(img2[matche[:,1],:2].T,SkyCoord(gaia[matche[:,0]]['ra']*u.deg,gaia[matche[:,0]]['dec']*u.deg))
+            try:
             
+                new_wcs = fit_wcs_from_points(img2[matche[:,1],:2].T,SkyCoord(gaia[matche[:,0]]['ra']*u.deg,gaia[matche[:,0]]['dec']*u.deg))
+                
+            except:
+            
+                new_wcs = fit_wcs_from_points(img2[matche[:,1],:2].T,SkyCoord(gaia[matche[:,0]]['ra'],gaia[matche[:,0]]['dec']))
         except:
-        
-            new_wcs = fit_wcs_from_points(img2[matche[:,1],:2].T,SkyCoord(gaia[matche[:,0]]['ra'],gaia[matche[:,0]]['dec']))
-    
+            breakpoint()
         print(i,len(matche),np.median(matches[:,2]))
         #
        
@@ -2404,7 +1829,7 @@ def get_matrice_transformation(cat1,cat2,match1,match2,factor=1,center1=0,center
                 matches.append((match1[i,1],match2[j,1]))
 
     matches = np.array(matches).astype(int)
-    breakpoint()
+
     model_robust, inliers = ransac( (factor*(cat1[matches[:,0],:2]-center1),factor*(cat2[matches[:,1],:2]-center2)), AffineTransform, min_samples=3, residual_threshold=0.5, max_trials=100)
     
     matrice = model_robust.params[:2]
